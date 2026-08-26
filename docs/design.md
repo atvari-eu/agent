@@ -52,7 +52,7 @@ agent/
 │   ├── config.rs               # ~/.config/agent/config.toml: defaults (incl. ollama), enabled features
 │   ├── providers/
 │   │   ├── mod.rs              # Provider trait, ProviderScope (Global | AgentLocked)
-│   │   ├── store.rs            # Credential storage (keyring, fallback to file)
+│   │   ├── store.rs            # Credential storage: OS keyring primary, encrypted file fallback
 │   │   ├── anthropic.rs        # API key + Claude subscription (OAuth device flow)
 │   │   ├── openai.rs
 │   │   └── ...
@@ -122,6 +122,9 @@ Commands:
   skill add|remove|list <NAME>
   hook add|remove|list <NAME>
   mcp add|remove|list <NAME> [-- <SERVER_COMMAND>...]
+  config set <KEY> <VALUE>     Set a [defaults] key (agent, provider, model, variant, ollama)
+  config get <KEY>
+  config unset <KEY>
   doctor                       Show resolved config, compatibility checks, sync status
   completions <SHELL>
 ```
@@ -150,6 +153,8 @@ trait LaunchableAgent {
 ```
 
 `LaunchEnv` carries the env vars, config-file writes, or CLI flags needed to hand the resolved provider/model/variant to a specific agent binary — each `agents/*.rs` module implements the translation for its agent.
+
+`Provider::authenticate`/`reauthenticate` behave differently by scope: `Global` providers (API-key-based) implement the flow directly in `providers/*.rs` (prompt for a key, or a standard OAuth device flow where the backend supports one). `AgentLocked` providers — a subscription tied to one agent's own account system, e.g. `claude-subscription` — do not reimplement that agent's OAuth; `authenticate` shells out to the agent's own login command (e.g. `claude /login`) and `agent provider add claude-subscription` just detects and records that the resulting session exists, rather than `agent` acquiring or storing the token itself. This sidesteps needing to reverse-engineer each vendor's device-flow details, at the cost of `reauthenticate` also being a delegated no-op — `agent` can prompt the user to re-run the agent's own login command but can't drive it headlessly.
 
 ## Use Case 1: Provider Compatibility Validation
 
@@ -191,6 +196,11 @@ Each of these triggers an `agents-compat sync` afterward so generated per-agent 
 
 On first run (or via `agent init`), `agent` walks the user through which `agents-compat` features to keep active for the current project/user: rules bridging, skills symlinks, MCP config sync, hooks/permissions translation. The selection is stored in `agent`'s own config and applied as a filter around each `agents-compat sync` invocation before every launch, so a user who, say, only wants shared MCP config and not rules bridging can opt out of the rest.
 
+`agents-compat`'s CLI currently only exposes `--agent` filtering (`scan|generate|sync|clean|status|watch`), not a per-feature one — so per-feature filtering ships in two phases rather than blocking on an upstream change:
+
+- **Phase 1 (initial release):** `agent init`'s selections are stored in config and shown in `agent doctor`, but every launch still runs the full unfiltered `agents-compat sync` — opting out of a feature stops `agent` from acting on it (e.g. `agent skill add` still works regardless, but a `[features] mcp = false` project is only a documented no-guarantee, not an enforced one).
+- **Phase 2:** once `agent` calls `agents-compat` as a library rather than shelling out to its CLI (already the stated general policy in [Dependencies](#dependencies)), it invokes `agents-compat`'s per-target-kind sync functions directly if the library exposes them at that granularity; if it doesn't yet, that becomes a tracked coordination item with `agents-compat` rather than something `agent` blocks its own v1 on.
+
 ## Use Case 5: Launching via `ollama launch`
 
 [`ollama launch <agent>`](https://docs.ollama.com/cli) is Ollama's own interactive setup flow (Ollama v0.15+): it configures and starts a supported coding CLI against a local or cloud Ollama model, with no env vars or config files needed on the agent's side. As of this writing it supports `claude`, `opencode`, `codex` (plus `vscode` and `droid`, which aren't `agent` launch targets) — notably not `cursor-agent` or `gemini`.
@@ -208,6 +218,10 @@ On first run (or via `agent init`), `agent` walks the user through which `agents
    - `--provider` and `--variant` are rejected as incompatible with `--ollama` (`--variant` has no equivalent in Ollama's launch flow), with a clear error rather than being silently ignored.
 3. **Sync** still runs as normal (Use Case 2, step 3) — `--ollama` only changes how the model is served, not whether `agents-compat`-generated config is fresh.
 4. **Exec** `ollama launch <agent-id>`, appending `--model <model>` if `--model` was given (letting Ollama's own TUI prompt for a model otherwise). Anything after ` -- ` is still forwarded, matching the non-`--ollama` path.
+
+`agent` does not probe for the `ollama` binary or its version before every `--ollama` exec — that would add latency to every launch for a check that's rarely wrong. Instead: `ollama launch` not being on `PATH` surfaces as a plain exec-not-found error (`error: 'ollama' not found on PATH — install from https://ollama.com`), and `agent doctor` separately runs a non-blocking presence + version check (warns if below v0.15) as part of its general environment report, so a stale/missing install is diagnosable without paying its cost on the hot path.
+
+`ollama launch <agent> --config` (configure without launching) isn't exposed by `agent` — using `ollama launch <agent> --config` directly covers that case, and `agent` isn't adding a passthrough for it unless a concrete need for driving it through `agent` specifically shows up later.
 
 ## Use Case 6: Interactive Agent Selection and Defaults
 
@@ -228,13 +242,15 @@ model = "claude-sonnet-5"
 ollama = false
 ```
 
-Any of `agent`/`provider`/`model`/`variant`/`ollama` may be set under `[defaults]`; a key left unset falls through to the underlying agent's own default rather than `agent` inventing one. There's no dedicated `agent config set` subcommand for these in this iteration — they're set either via the Use Case 6 step 2 prompt (for `agent`) or by editing `config.toml` directly (for the rest); a `provider`/`model`/`variant`-equivalent interactive default-setting flow is an open question below.
+Any of `agent`/`provider`/`model`/`variant`/`ollama` may be set under `[defaults]`; a key left unset falls through to the underlying agent's own default rather than `agent` inventing one. `agent config set <key> <value>` (and `get`/`unset`) is the one mechanism for writing any of these keys — no separate interactive flow for `provider`/`model`/`variant` beyond that. The Use Case 6 step 2 prompt is sugar over the same primitive: accepting it runs `agent config set agent <picked>` rather than writing `config.toml` through a second code path.
 
-## Open Questions
+## Resolved Decisions
 
-- `agents-compat`'s CLI currently only exposes `--agent` filtering (`scan|generate|sync|clean|status|watch`), not a per-feature filter. Selective feature sync (Use Case 4) needs either a new `agents-compat` flag/config file, or `agent` needs to call finer-grained library functions directly rather than the `sync` subcommand as a whole. Track as a coordination item with `agents-compat`.
-- Credential storage backend (OS keyring vs. encrypted file vs. plain file with a warning) needs a decision before `providers/store.rs` is implemented — affects portability to headless/CI environments.
-- OAuth device-flow details for subscription-based providers (e.g. Claude subscription) depend on what each agent's own auth flow exposes; may not be scriptable for every agent.
-- Whether `agent` should check for `ollama` on `PATH` and its version (`ollama launch` requires v0.15+) before exec, versus letting the exec fail and forwarding `ollama`'s own error — leaning toward a `doctor` check (non-blocking) plus a fast exec-not-found error, consistent with Design Principle 3.
-- `ollama launch <agent> --config` (configure without launching) isn't exposed by `agent` yet — deferred until there's a concrete need to configure-without-launching through `agent` rather than calling `ollama launch --config` directly.
-- Whether `--provider`/`--model`/`--variant` defaults (Use Case 6) need their own interactive prompt/persist flow (mirroring the agent-selection prompt), or a `agent config set <key> <value>` command, versus staying edit-`config.toml`-by-hand only, as designed today.
+Formerly open questions; kept here for traceability, with the reasoning behind each call and where it's reflected in the doc.
+
+- **Per-feature `agents-compat` sync granularity** (Use Case 4): ship in two phases rather than block on an upstream CLI change — Phase 1 stores the selection and runs full sync anyway; Phase 2 switches to `agents-compat`'s library API once it's called directly (already the general policy, see [Dependencies](#dependencies)) and exposes that granularity, tracking the gap with `agents-compat` as a coordination item if it doesn't yet.
+- **Credential storage backend** (`providers/store.rs`): OS keyring primary, encrypted file fallback for headless environments without a keyring service; no unencrypted plain-file storage. Reasoning: matches common practice for CLI credential storage (e.g. `gh`, git credential managers) and keeps CI/headless portability without weakening the default.
+- **OAuth device-flow for `AgentLocked` subscription providers**: `agent` doesn't reimplement each vendor's OAuth — `authenticate` delegates to the underlying agent's own login command (e.g. `claude /login`) and just detects/records the resulting session (see the paragraph after [Core Traits](#core-traits)). Reasoning: avoids reverse-engineering device-flow details per agent, at the cost of `reauthenticate` also being a delegated, non-headless action.
+- **`ollama` binary/version checks**: no probe on the `--ollama` exec path (adds latency for a rarely-wrong check); missing binary surfaces as a plain exec-not-found error, version is checked non-blockingly by `agent doctor` only (see [Use Case 5](#use-case-5-launching-via-ollama-launch)).
+- **`ollama launch <agent> --config`**: not exposed through `agent` — call `ollama launch --config` directly; revisit only if a concrete need for driving it through `agent` shows up.
+- **`--provider`/`--model`/`--variant` defaults**: no separate interactive flow — `agent config set|get|unset <key> [<value>]` is the one mechanism for all `[defaults]` keys, including `agent` itself; the Use Case 6 persist prompt is sugar over `agent config set agent <picked>` (see [Use Case 6](#use-case-6-interactive-agent-selection-and-defaults)).
