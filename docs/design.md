@@ -45,6 +45,20 @@ These commands write to the same canonical locations as existing provider comman
 
 Each skill add/remove command triggers an `agents-compat sync` afterward so generated per-agent files reflect the change immediately.
 
+## Protocol: ACP
+
+`agent` supports launching [ACP (Agent Client Protocol)](https://agentclientprotocol.com/)-compatible clients (such as [goose](https://github.com/goose-go/goose)), enabling a single client binary to work with multiple different ACP-compatible agent backends. This addresses the problem of being locked into one agent's CLI while still benefiting from ACP's standardized client interface.
+
+- **List ACP-capable agents** via `agent agent list --source acp` — queries the ACP registry for agents that speak the protocol and are compatible with the `agent` CLI
+- **Add ACP agent** via `agent agent add <NAME> --source acp` — registers an ACP-compatible agent (e.g. goose, open-cow), storing its endpoint URL, authentication details, and supported capabilities
+- **Set default ACP agent** via `agent agent set-default <NAME> --source acp` — pins an ACP agent as the default for `agent` launches, writeable into `[defaults]` under `agent`
+- **Launch with ACP** via `agent --agent <acp-agent-name> <command>` — the `agent` CLI translates the request into an ACP-compatible launch, configuring the ACP client (goose) to connect to the registered ACP agent backend
+- **Cross-agent consistency** — once an ACP agent is configured via `agent`, the same `agent` command syntax works regardless of which specific ACP-backed agent is running, since ACP standardizes the client-agent wire format
+
+Each ACP agent add/set-default command triggers an `agents-compat sync` afterward so generated per-agent config reflects the change immediately.
+
+ACP clients like goose are configured with the agent's ACP endpoint and authenticate via standardized ACP credentials (OAuth, API key, or agent-session-based), allowing them to be used interchangeably with any ACP-compatible agent backend without modifying client configuration.
+
 ## Supported Agents
 
 Same set as `agents-compat` supports as generation targets — this list grows in lockstep with it:
@@ -146,6 +160,8 @@ Commands:
   skill add|remove|list <NAME> [--source skills_sh]
   hook add|remove|list <NAME>
   mcp add|remove|list <NAME> [-- <SERVER_COMMAND>...]
+  agent add|remove|list <NAME> [--source acp]
+  agent set-default <NAME> [--source acp]
   config set <KEY> <VALUE>     Set a [defaults] key (agent, provider, model, variant, ollama)
   config get <KEY>
   config unset <KEY>
