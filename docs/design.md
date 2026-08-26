@@ -23,6 +23,28 @@ Running more than one AI coding agent day to day means juggling separate logins,
 4. **Convenience commands write canonical sources, not generated files** — `agent skill/hook/mcp add` write to the same canonical locations `agents-compat` scans (`.agents/skills/`, `.agents/mcp.json`, `.agents/hooks.json`), then trigger a sync. They never touch agent-specific generated output directly.
 5. **Opt-in scope** — first run lets the user pick which `agents-compat` features they want active; `agent` should be useful even for someone who only wants the provider/launcher part.
 
+## Models & Providers: models.dev
+
+`models.dev` is a centralized registry for AI models and providers. `agent` integrates with its API to:
+
+- **Browse providers** via `agent provider list --source modelsdev` — fetches provider metadata (IDs, scopes, capabilities) from models.dev and populates the provider store
+- **Add providers** via `agent provider add <ID> --source modelsdev` — resolves provider details from models.dev and stores credentials
+- **Browse models** via `agent model list --source modelsdev` — lists available models with their providers, variants, and capabilities
+- **Select models** via `agent model set <MODEL> --source modelsdev` — pins a model as a cross-agent default in `[defaults]`
+
+These commands write to the same canonical locations as existing provider commands, triggering a sync afterward.
+
+## Skills: skills.sh
+
+`skills.sh` is the standard skill management CLI used by `agents-compat`. `agent` integrates with it to:
+
+- **List skills** via `agent skill list --source skills_sh` — queries skills.sh API for available skills
+- **Add skills** via `agent skill add <NAME> --source skills_sh` — scaffolds `.agents/skills/<name>/SKILL.md` from skills.sh templates and triggers sync
+- **Remove skills** via `agent skill remove <NAME> --source skills_sh` — removes skill scaffold and triggers sync
+- **List skills** via `agent skill list` — existing behavior unchanged
+
+Each skill add/remove command triggers an `agents-compat sync` afterward so generated per-agent files reflect the change immediately.
+
 ## Supported Agents
 
 Same set as `agents-compat` supports as generation targets — this list grows in lockstep with it:
@@ -115,11 +137,13 @@ Options:
 
 Commands:
   init                         First-run wizard: pick enabled agents-compat features
-  provider add <ID> [--api-key | --subscription]
+  provider add <ID> [--api-key | --subscription] [--source modelsdev]
   provider remove <ID>
   provider reauth <ID>
   provider list
-  skill add|remove|list <NAME>
+  model list [--source modelsdev]
+  model set <MODEL> [--source modelsdev]
+  skill add|remove|list <NAME> [--source skills_sh]
   hook add|remove|list <NAME>
   mcp add|remove|list <NAME> [-- <SERVER_COMMAND>...]
   config set <KEY> <VALUE>     Set a [defaults] key (agent, provider, model, variant, ollama)
@@ -244,9 +268,35 @@ ollama = false
 
 Any of `agent`/`provider`/`model`/`variant`/`ollama` may be set under `[defaults]`; a key left unset falls through to the underlying agent's own default rather than `agent` inventing one. `agent config set <key> <value>` (and `get`/`unset`) is the one mechanism for writing any of these keys — no separate interactive flow for `provider`/`model`/`variant` beyond that. The Use Case 6 step 2 prompt is sugar over the same primitive: accepting it runs `agent config set agent <picked>` rather than writing `config.toml` through a second code path.
 
-## Resolved Decisions
+## Use Case 7: MCP.Directory Integration
 
-Formerly open questions; kept here for traceability, with the reasoning behind each call and where it's reflected in the doc.
+Agents can discover, install, and sync MCP servers from MCP.Directory (mcp.directory) as a remote skill/source. When `agent mcp add` is used with a MCP.Directory server name, the flow is:
+
+1. **Resolve** — `agent mcp add <name>` attempts to look up `<name>` on MCP.Directory API, fetching server metadata (description, commands, security scan status, install command)
+2. **Validate** — if found, verify the server is security-scanned and approved; if not found locally, prompt to fetch install command
+3. **Add** — write `.agents/mcp.json` entry with the MCP server config (same canonical location as local `agent mcp add`)
+4. **Sync** — trigger `agents-compat sync` to propagate the new MCP config to all target agents (`.claude/mcp.json`, `.cursor/mcp.json`, etc.)
+5. **Exec** — on next launch, the agent CLI can connect to the MCP server via its stdio/sse transport
+
+Command examples:
+
+```bash
+# Discover and add an MCP server from MCP.Directory by name
+agent mcp add command-executor
+
+# Add with custom command (overrides discovered config)
+agent mcp add command-executor -- git-ls
+
+# List all MCP sources (local + MCP.Directory)
+agent mcp list
+
+# Remove an MCP server (local or MCP.Directory-sourced)
+agent mcp remove command-executor
+```
+
+## Use Case 6: Interactive Agent Selection and Defaults
+
+`agent` invoked with no agent resolvable from the positional argument, `--agent`, or `[defaults].agent` in `~/.config/agent/config.toml` prompts interactively rather than erroring:
 
 - **Per-feature `agents-compat` sync granularity** (Use Case 4): ship in two phases rather than block on an upstream CLI change — Phase 1 stores the selection and runs full sync anyway; Phase 2 switches to `agents-compat`'s library API once it's called directly (already the general policy, see [Dependencies](#dependencies)) and exposes that granularity, tracking the gap with `agents-compat` as a coordination item if it doesn't yet.
 - **Credential storage backend** (`providers/store.rs`): OS keyring primary, encrypted file fallback for headless environments without a keyring service; no unencrypted plain-file storage. Reasoning: matches common practice for CLI credential storage (e.g. `gh`, git credential managers) and keeps CI/headless portability without weakening the default.
