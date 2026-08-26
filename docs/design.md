@@ -27,13 +27,15 @@ Running more than one AI coding agent day to day means juggling separate logins,
 
 Same set as `agents-compat` supports as generation targets — this list grows in lockstep with it:
 
-| Agent | Launch binary | Externally-configurable provider |
-|---|---|---|
-| Claude Code | `claude` | Only for providers compatible with Claude Code's provider interface |
-| Gemini CLI | `gemini` | Yes |
-| Cursor | `cursor-agent` | Yes |
-| OpenCode | `opencode` | Yes |
-| Codex | `codex` | Yes |
+| Agent | Launch binary | Externally-configurable provider | `ollama launch` support |
+|---|---|---|---|
+| Claude Code | `claude` | Only for providers compatible with Claude Code's provider interface | Yes |
+| Gemini CLI | `gemini` | Yes | No |
+| Cursor | `cursor-agent` | Yes | No |
+| OpenCode | `opencode` | Yes | Yes |
+| Codex | `codex` | Yes | Yes |
+
+`ollama launch` support is upstream Ollama's, not ours to extend — see [Use Case 5](#use-case-5-launching-via-ollama-launch).
 
 ## Architecture
 
@@ -47,7 +49,7 @@ agent/
 │   ├── lib.rs
 │   ├── cli.rs                  # Clap parser
 │   ├── error.rs                # Error types + exit codes
-│   ├── config.rs               # ~/.config/agent/config.toml: defaults, enabled features
+│   ├── config.rs               # ~/.config/agent/config.toml: defaults (incl. ollama), enabled features
 │   ├── providers/
 │   │   ├── mod.rs              # Provider trait, ProviderScope (Global | AgentLocked)
 │   │   ├── store.rs            # Credential storage (keyring, fallback to file)
@@ -103,6 +105,8 @@ Options:
   --variant <VARIANT>         e.g. reasoning-effort / thinking variant
   --agent <AGENT>             Target agent to launch [claude|cursor|gemini|opencode|codex]
   --project-root <PATH>
+  --ollama                    Launch via `ollama launch <agent>` instead of the agent binary directly
+  --no-ollama                 Override a config default of ollama = true for this invocation
 
 Commands:
   init                         First-run wizard: pick enabled agents-compat features
@@ -134,6 +138,7 @@ trait LaunchableAgent {
     fn binary(&self) -> &str;
     fn accepts(&self, provider: &dyn Provider) -> bool;
     fn apply_provider(&self, cred: &Credential, model: &str, variant: Option<&str>) -> LaunchEnv;
+    fn supports_ollama_launch(&self) -> bool;   // whether `ollama launch <id>` exists upstream
 }
 ```
 
@@ -157,11 +162,13 @@ This check happens before `agents-compat sync` runs and before any subprocess is
 
 ## Use Case 2: Launching an Agent
 
-1. **Resolve** `--provider`/`--model`/`--variant`/`--agent` from flags, falling back to config defaults (`~/.config/agent/config.toml`).
-2. **Validate** the provider/agent pairing (Use Case 1).
-3. **Sync** by invoking `agents-compat` scoped to `--project-root` (or the auto-detected project root), respecting the feature set chosen at `agent init` (Use Case 4).
-4. **Translate** the resolved provider credential, model, and variant into the target agent's `LaunchEnv` via `LaunchableAgent::apply_provider`.
-5. **Exec** the target binary (replacing the current process), forwarding everything after ` -- ` verbatim.
+1. **Resolve** `--provider`/`--model`/`--variant`/`--agent`/`--ollama` from flags, falling back to config defaults (`~/.config/agent/config.toml`).
+2. **Validate** the provider/agent pairing (Use Case 1), or the `--ollama`/agent pairing (Use Case 5) when `--ollama` is active.
+3. **Sync** by invoking `agents-compat` scoped to `--project-root` (or the auto-detected project root), respecting the feature set chosen at `agent init` (Use Case 4). This runs regardless of launch mode — instructions/skills/MCP config apply no matter who serves the model.
+4. **Translate**:
+   - Default mode: the resolved provider credential, model, and variant into the target agent's `LaunchEnv` via `LaunchableAgent::apply_provider`.
+   - `--ollama` mode: skip provider resolution and build an `ollama launch <agent> [--model <model>]` invocation instead (Use Case 5).
+5. **Exec** the resulting command (replacing the current process), forwarding everything after ` -- ` verbatim.
 
 ## Use Case 3: Managing Skills, Hooks, and MCP Servers
 
@@ -177,8 +184,26 @@ Each of these triggers an `agents-compat sync` afterward so generated per-agent 
 
 On first run (or via `agent init`), `agent` walks the user through which `agents-compat` features to keep active for the current project/user: rules bridging, skills symlinks, MCP config sync, hooks/permissions translation. The selection is stored in `agent`'s own config and applied as a filter around each `agents-compat sync` invocation before every launch, so a user who, say, only wants shared MCP config and not rules bridging can opt out of the rest.
 
+## Use Case 5: Launching via `ollama launch`
+
+[`ollama launch <agent>`](https://docs.ollama.com/cli) is Ollama's own interactive setup flow (Ollama v0.15+): it configures and starts a supported coding CLI against a local or cloud Ollama model, with no env vars or config files needed on the agent's side. As of this writing it supports `claude`, `opencode`, `codex` (plus `vscode` and `droid`, which aren't `agent` launch targets) — notably not `cursor-agent` or `gemini`.
+
+`--ollama` is a launch-mode switch, not a provider: when active, `agent` does not resolve `--provider`/credentials at all, because Ollama supplies and serves the model itself.
+
+1. **Enable** via `--ollama` on the command line, or `ollama = true` under `[defaults]` in `~/.config/agent/config.toml` — the flag/config value is resolved the same way as `--provider`/`--model`/etc. (Use Case 2, step 1). `--no-ollama` overrides a config default of `true` for a single invocation.
+2. **Validate** `LaunchableAgent::supports_ollama_launch()` for the requested `--agent` before doing anything else. Requesting `--ollama --agent cursor` fails fast with:
+   ```
+   error: `--ollama` is not supported for `--agent cursor`
+          (ollama launch supports: claude, opencode, codex)
+   ```
+   This mirrors the Use Case 1 provider-compatibility check: no partial launch, no error forwarded from `ollama` or the underlying agent CLI.
+3. **Sync** still runs as normal (Use Case 2, step 3) — `--ollama` only changes how the model is served, not whether `agents-compat`-generated config is fresh.
+4. **Exec** `ollama launch <agent-id>`, appending `--model <model>` if `--model` was given (letting Ollama's own TUI prompt for a model otherwise). `--provider` and `--variant` are rejected as incompatible with `--ollama` (`--variant` has no equivalent in Ollama's launch flow), with a clear error rather than being silently ignored. Anything after ` -- ` is still forwarded, matching the non-`--ollama` path.
+
 ## Open Questions
 
 - `agents-compat`'s CLI currently only exposes `--agent` filtering (`scan|generate|sync|clean|status|watch`), not a per-feature filter. Selective feature sync (Use Case 4) needs either a new `agents-compat` flag/config file, or `agent` needs to call finer-grained library functions directly rather than the `sync` subcommand as a whole. Track as a coordination item with `agents-compat`.
 - Credential storage backend (OS keyring vs. encrypted file vs. plain file with a warning) needs a decision before `providers/store.rs` is implemented — affects portability to headless/CI environments.
 - OAuth device-flow details for subscription-based providers (e.g. Claude subscription) depend on what each agent's own auth flow exposes; may not be scriptable for every agent.
+- Whether `agent` should check for `ollama` on `PATH` and its version (`ollama launch` requires v0.15+) before exec, versus letting the exec fail and forwarding `ollama`'s own error — leaning toward a `doctor` check (non-blocking) plus a fast exec-not-found error, consistent with Design Principle 3.
+- `ollama launch <agent> --config` (configure without launching) isn't exposed by `agent` yet — deferred until there's a concrete need to configure-without-launching through `agent` rather than calling `ollama launch --config` directly.

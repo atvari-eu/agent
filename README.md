@@ -17,6 +17,7 @@ Every AI coding agent (Claude Code, Cursor, Codex, Gemini CLI, OpenCode, ...) ha
 - Select provider, model, variant, and agent via flags, validated against the current configuration
 - Reject agent-locked providers (e.g. a Claude subscription) when used with an incompatible agent, with a clear error instead of a forwarded failure
 - Pass provider-specific arguments straight through to the underlying agent CLI after ` -- `
+- Launch agents against local/cloud Ollama models via `ollama launch`, opt-in via `--ollama` or a global config default
 - Manage skills, hooks, and MCP servers, synced via `agents-compat`
 - First-run wizard to enable/disable individual `agents-compat` features
 
