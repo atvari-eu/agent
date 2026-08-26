@@ -10,6 +10,13 @@ An AI agent launcher with shared configuration, powered by [agents-compat](https
 
 Every AI coding agent (Claude Code, Cursor, Codex, Gemini CLI, OpenCode, ...) has its own config format, its own auth flow, and its own CLI conventions. `agents-compat` already solves shared instructions, skills, and MCP config by generating agent-specific files from open standards. `agent` builds on top of that: a single launcher command that keeps those generated configs current and then starts whichever agent CLI you asked for, with a consistent way to pick a provider, model, and variant across all of them.
 
+## Benefits
+
+- **Switch agents without migrating config** — instructions, skills, and MCP servers are defined once and synced to whichever agent you launch, so trying a new agent CLI doesn't mean copying rules and re-wiring MCP servers by hand
+- **One set of flags across every agent** — pick provider, model, and variant the same way regardless of which underlying CLI ends up running, instead of relearning each tool's own flags/env vars
+- **Fail fast on incompatible setups** — agent-locked providers (e.g. a Claude subscription) are rejected before anything launches, with a clear error instead of a confusing failure from the underlying CLI
+- **Never launch against stale config** — `agents-compat` sync runs before every launch, so generated files always reflect your current instructions/skills/MCP config
+
 ## Planned Features
 
 - Launch any agent supported by `agents-compat`, syncing its generated config beforehand

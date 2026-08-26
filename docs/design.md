@@ -57,7 +57,7 @@ agent/
 │   │   ├── openai.rs
 │   │   └── ...
 │   ├── agents/
-│   │   ├── mod.rs              # Launch trait: binary name, provider/model/variant mapping
+│   │   ├── mod.rs              # Launch trait: binary name, provider/model/variant mapping, ollama-launch support
 │   │   ├── claude.rs
 │   │   ├── cursor.rs
 │   │   ├── gemini.rs
@@ -97,7 +97,12 @@ tempfile = "3"
 ### CLI Interface
 
 ```
-agent [OPTIONS] [-- <AGENT_ARGS>...]
+agent [AGENT] [OPTIONS] [-- <AGENT_ARGS>...]
+
+Arguments:
+  [AGENT]                      Target agent to launch [claude|cursor|gemini|opencode|codex] —
+                                positional shorthand for --agent. If omitted and no default
+                                agent is configured, `agent` prompts interactively (Use Case 6).
 
 Options:
   --provider <PROVIDER>       Provider id (e.g. anthropic, claude-subscription, openai)
@@ -120,6 +125,8 @@ Commands:
   doctor                       Show resolved config, compatibility checks, sync status
   completions <SHELL>
 ```
+
+`agent claude` is equivalent to `agent --agent claude`; the positional form is the common case, `--agent` remains for scripts/completions that prefer explicit flags or need to place the agent after other options. Both resolve to the same `--agent` value (Use Case 2, step 1), so specifying both with conflicting values (`agent claude --agent cursor`) is a validation error, not a silent pick of one, per Design Principle 3. Agent names are reserved words in the positional slot: they cannot collide with subcommands (`init`, `provider`, `skill`, `hook`, `mcp`, `doctor`, `completions`) today, and any new subcommand must avoid colliding with a supported agent id.
 
 Anything after a literal ` -- ` is passed through unmodified to the underlying agent CLI, after `agent`'s own flags have been parsed.
 
@@ -162,7 +169,7 @@ This check happens before `agents-compat sync` runs and before any subprocess is
 
 ## Use Case 2: Launching an Agent
 
-1. **Resolve** `--provider`/`--model`/`--variant`/`--agent`/`--ollama` from flags, falling back to config defaults (`~/.config/agent/config.toml`).
+1. **Resolve** `--provider`/`--model`/`--variant`/`--agent` (or its positional shorthand, `agent <agent>`)/`--ollama` from flags, falling back to config defaults (`~/.config/agent/config.toml`). If no agent can be resolved this way, fall back further to interactive selection (Use Case 6) before continuing.
 2. **Validate** the provider/agent pairing (Use Case 1), or the `--ollama`/agent pairing (Use Case 5) when `--ollama` is active.
 3. **Sync** by invoking `agents-compat` scoped to `--project-root` (or the auto-detected project root), respecting the feature set chosen at `agent init` (Use Case 4). This runs regardless of launch mode — instructions/skills/MCP config apply no matter who serves the model.
 4. **Translate**:
@@ -191,14 +198,37 @@ On first run (or via `agent init`), `agent` walks the user through which `agents
 `--ollama` is a launch-mode switch, not a provider: when active, `agent` does not resolve `--provider`/credentials at all, because Ollama supplies and serves the model itself.
 
 1. **Enable** via `--ollama` on the command line, or `ollama = true` under `[defaults]` in `~/.config/agent/config.toml` — the flag/config value is resolved the same way as `--provider`/`--model`/etc. (Use Case 2, step 1). `--no-ollama` overrides a config default of `true` for a single invocation.
-2. **Validate** `LaunchableAgent::supports_ollama_launch()` for the requested `--agent` before doing anything else. Requesting `--ollama --agent cursor` fails fast with:
-   ```
-   error: `--ollama` is not supported for `--agent cursor`
-          (ollama launch supports: claude, opencode, codex)
-   ```
-   This mirrors the Use Case 1 provider-compatibility check: no partial launch, no error forwarded from `ollama` or the underlying agent CLI.
+2. **Validate**, before doing anything else (no subprocess spawned yet, consistent with Design Principle 3):
+   - `LaunchableAgent::supports_ollama_launch()` for the requested `--agent`. Requesting `--ollama --agent cursor` fails fast with:
+     ```
+     error: `--ollama` is not supported for `--agent cursor`
+            (ollama launch supports: claude, opencode, codex)
+     ```
+     This mirrors the Use Case 1 provider-compatibility check: no partial launch, no error forwarded from `ollama` or the underlying agent CLI.
+   - `--provider` and `--variant` are rejected as incompatible with `--ollama` (`--variant` has no equivalent in Ollama's launch flow), with a clear error rather than being silently ignored.
 3. **Sync** still runs as normal (Use Case 2, step 3) — `--ollama` only changes how the model is served, not whether `agents-compat`-generated config is fresh.
-4. **Exec** `ollama launch <agent-id>`, appending `--model <model>` if `--model` was given (letting Ollama's own TUI prompt for a model otherwise). `--provider` and `--variant` are rejected as incompatible with `--ollama` (`--variant` has no equivalent in Ollama's launch flow), with a clear error rather than being silently ignored. Anything after ` -- ` is still forwarded, matching the non-`--ollama` path.
+4. **Exec** `ollama launch <agent-id>`, appending `--model <model>` if `--model` was given (letting Ollama's own TUI prompt for a model otherwise). Anything after ` -- ` is still forwarded, matching the non-`--ollama` path.
+
+## Use Case 6: Interactive Agent Selection and Defaults
+
+`agent` invoked with no agent resolvable from the positional argument, `--agent`, or `[defaults].agent` in `~/.config/agent/config.toml` prompts interactively rather than erroring:
+
+1. **Prompt** — list the supported agents (see [Supported Agents](#supported-agents)) and ask the user to pick one, the same `dialoguer`-based single-select style used by `agent init` (Use Case 4). This step is skipped entirely once an agent is resolved from the positional arg, `--agent`, or the config default — it only fires when none of those apply.
+2. **Offer to persist** — after picking, ask "set `<agent>` as the default agent? [y/N]". If accepted, write `agent = "<agent>"` under `[defaults]` in `~/.config/agent/config.toml`, so future no-argument invocations skip straight to step 3 without prompting.
+3. **Continue the launch** — proceeds into Use Case 2 (Validate → Sync → Translate → Exec) using the picked agent, exactly as if it had been passed via `--agent`.
+4. **Non-interactive contexts** — when stdin isn't a TTY (CI, scripts) and no agent can be resolved, `agent` fails fast with an actionable error (e.g. `error: no agent specified and none configured as default; pass --agent or run \`agent\` interactively`) instead of hanging on a prompt it can't render, per Design Principle 3.
+
+For `--provider`/`--model`/`--variant`, a missing value is **not** prompted for and does not block the launch: `agent` passes nothing extra for that option and lets the target agent's own `LaunchableAgent::apply_provider` fall through to whatever that agent CLI already defaults to on its own (e.g. `claude` run with no provider override behaves exactly as `claude` invoked directly would). `agent` does, however, let a user pin cross-agent defaults for these explicitly via the same `[defaults]` table used for the launch agent and `--ollama`:
+
+```toml
+[defaults]
+agent = "claude"
+provider = "anthropic"
+model = "claude-sonnet-5"
+ollama = false
+```
+
+Any of `agent`/`provider`/`model`/`variant`/`ollama` may be set under `[defaults]`; a key left unset falls through to the underlying agent's own default rather than `agent` inventing one. There's no dedicated `agent config set` subcommand for these in this iteration — they're set either via the Use Case 6 step 2 prompt (for `agent`) or by editing `config.toml` directly (for the rest); a `provider`/`model`/`variant`-equivalent interactive default-setting flow is an open question below.
 
 ## Open Questions
 
@@ -207,3 +237,4 @@ On first run (or via `agent init`), `agent` walks the user through which `agents
 - OAuth device-flow details for subscription-based providers (e.g. Claude subscription) depend on what each agent's own auth flow exposes; may not be scriptable for every agent.
 - Whether `agent` should check for `ollama` on `PATH` and its version (`ollama launch` requires v0.15+) before exec, versus letting the exec fail and forwarding `ollama`'s own error — leaning toward a `doctor` check (non-blocking) plus a fast exec-not-found error, consistent with Design Principle 3.
 - `ollama launch <agent> --config` (configure without launching) isn't exposed by `agent` yet — deferred until there's a concrete need to configure-without-launching through `agent` rather than calling `ollama launch --config` directly.
+- Whether `--provider`/`--model`/`--variant` defaults (Use Case 6) need their own interactive prompt/persist flow (mirroring the agent-selection prompt), or a `agent config set <key> <value>` command, versus staying edit-`config.toml`-by-hand only, as designed today.
